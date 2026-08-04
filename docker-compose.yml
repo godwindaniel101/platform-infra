@@ -1,0 +1,81 @@
+name: pact-routing-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pri-postgres
+    environment:
+      POSTGRES_USER: pact
+      POSTGRES_PASSWORD: pact
+      POSTGRES_DB: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pact -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  redis:
+    image: redis:7-alpine
+    container_name: pri-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  pact-broker-db:
+    image: postgres:16-alpine
+    container_name: pri-broker-db
+    environment:
+      POSTGRES_USER: broker
+      POSTGRES_PASSWORD: broker
+      POSTGRES_DB: pact_broker
+    volumes:
+      - brokerdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U broker -d pact_broker"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  pact-broker:
+    image: pactfoundation/pact-broker:2.142.0-pactbroker2.120.0
+    container_name: pri-pact-broker
+    depends_on:
+      pact-broker-db:
+        condition: service_healthy
+    ports:
+      - "9292:9292"
+    environment:
+      PACT_BROKER_PORT: "9292"
+      PACT_BROKER_DATABASE_ADAPTER: postgres
+      PACT_BROKER_DATABASE_HOST: pact-broker-db
+      PACT_BROKER_DATABASE_NAME: pact_broker
+      PACT_BROKER_DATABASE_USERNAME: broker
+      PACT_BROKER_DATABASE_PASSWORD: broker
+      PACT_BROKER_BASIC_AUTH_USERNAME: pact
+      PACT_BROKER_BASIC_AUTH_PASSWORD: pact
+      PACT_BROKER_ALLOW_PUBLIC_READ: "true"
+      PACT_BROKER_LOG_LEVEL: INFO
+      PACT_BROKER_WEBHOOK_HOST_WHITELIST: "host.docker.internal localhost 127.0.0.1"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O - http://localhost:9292/diagnostic/status/heartbeat || exit 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+volumes:
+  pgdata:
+  brokerdata:

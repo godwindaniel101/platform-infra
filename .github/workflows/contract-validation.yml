@@ -1,0 +1,242 @@
+name: contract validation
+
+# The cross-repo proof.
+#
+# Neither service repository may know about the other, so neither can verify the
+# PAIR. This repository is the only one allowed to know about both, so the full
+# contract loop is proven here:
+#
+#   publish both contracts -> verify both providers -> can-i-deploy both -> e2e
+#
+# The second job is the one that matters. A pipeline that only goes green proves
+# nothing: it might be green because the check does nothing. So the second job
+# BREAKS a field on purpose and FAILS if the gate stays green.
+#
+# The broker runs from this repository's own docker-compose.yml, which means the
+# compose file is under test too. A hosted broker is what production uses; see
+# the README.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: contract-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  PACT_BROKER_BASE_URL: http://localhost:9292
+  PACT_BROKER_USERNAME: pact
+  PACT_BROKER_PASSWORD: pact
+  PACT_BRANCH: main
+
+jobs:
+  full-contract-loop:
+    name: the whole loop, both directions
+    runs-on: ubuntu-latest
+
+    steps:
+      # The three repositories must sit next to each other, because the e2e
+      # harness starts the built service from a sibling directory.
+      - name: check out platform-infra
+        uses: actions/checkout@v4
+        with:
+          path: platform-infra
+          fetch-depth: 0
+
+      - name: check out disbursement-service
+        uses: actions/checkout@v4
+        with:
+          repository: godwindaniel101/disbursement-service
+          path: disbursement-service
+          fetch-depth: 0
+
+      - name: check out switch-service
+        uses: actions/checkout@v4
+        with:
+          repository: godwindaniel101/switch-service
+          path: switch-service
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: start postgres, redis and the pact broker
+        working-directory: platform-infra
+        run: |
+          docker compose up -d
+          npm ci
+          npm run wait-for-infra
+
+      - name: create the broker environments
+        working-directory: platform-infra
+        run: npm run webhooks
+
+      - name: install and build both services
+        run: |
+          cd disbursement-service && npm ci && npm run build && cd ..
+          cd switch-service && npm ci && npm run console:build && npm run build && cd ..
+
+      # STEP 1. Each repository writes what it NEEDS and gives it to the broker.
+      - name: publish the contract of disbursement-service
+        working-directory: disbursement-service
+        run: |
+          npm run pact:consumer
+          npm run pact:publish
+
+      - name: publish the contract of switch-service
+        working-directory: switch-service
+        run: |
+          npm run pact:consumer
+          npm run pact:publish
+
+      # STEP 2. Each repository proves it still keeps its own promise. It reads
+      # the expectation FROM THE BROKER, never from a file in its own tree.
+      - name: switch-service verifies the HTTP contract
+        working-directory: switch-service
+        run: npm run pact:provider
+        env:
+          PACT_DATABASE_URL: postgres://pact:pact@localhost:5434/switch_test_db
+          PACT_REDIS_URL: redis://localhost:6380/1
+
+      - name: disbursement-service verifies the message contract
+        working-directory: disbursement-service
+        run: npm run pact:provider
+
+      # STEP 3. The gate. It must answer YES for both, in both directions.
+      - name: can-i-deploy disbursement-service
+        working-directory: disbursement-service
+        run: npm run pact:can-i-deploy
+
+      - name: can-i-deploy switch-service
+        working-directory: switch-service
+        run: npm run pact:can-i-deploy
+
+      # STEP 4. Behaviour. A contract test proves the shape of the wire and
+      # nothing else. Only this can answer "does the switch move traffic off a
+      # failing channel, and how fast".
+      - name: end-to-end scenarios
+        working-directory: platform-infra
+        run: npm run e2e
+
+      - name: keep the logs when something fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop-logs
+          path: |
+            platform-infra/logs/
+            disbursement-service/pacts/
+            switch-service/pacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  prove-the-gate-catches-a-break:
+    name: a real break must turn the gate RED
+    runs-on: ubuntu-latest
+    needs: full-contract-loop
+
+    steps:
+      - name: check out platform-infra
+        uses: actions/checkout@v4
+        with:
+          path: platform-infra
+          fetch-depth: 0
+
+      - name: check out disbursement-service
+        uses: actions/checkout@v4
+        with:
+          repository: godwindaniel101/disbursement-service
+          path: disbursement-service
+          fetch-depth: 0
+
+      - name: check out switch-service
+        uses: actions/checkout@v4
+        with:
+          repository: godwindaniel101/switch-service
+          path: switch-service
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: start the infrastructure
+        working-directory: platform-infra
+        run: |
+          docker compose up -d
+          npm ci
+          npm run wait-for-infra
+
+      - name: install both services
+        run: |
+          cd disbursement-service && npm ci && cd ..
+          cd switch-service && npm ci && cd ..
+
+      - name: publish the honest contract of disbursement-service
+        working-directory: disbursement-service
+        run: |
+          npm run pact:consumer
+          npm run pact:publish
+
+      # THE BREAK.
+      #
+      # Rename one field of the response. This is the change that looks harmless
+      # in review, that every unit test in switch-service accepts, and that
+      # breaks a different repository in production.
+      - name: break the wire on purpose
+        working-directory: switch-service
+        run: |
+          sed -i 's/        strategy: decision.strategy,/        routingStrategy: decision.strategy,/' \
+            src/controllers/routing.controller.ts
+          grep -q 'routingStrategy: decision.strategy' src/controllers/routing.controller.ts
+          echo "renamed the response field 'strategy' to 'routingStrategy'"
+
+      - name: the unit tests must still pass, which is the whole point
+        working-directory: switch-service
+        run: |
+          npm run test:unit
+          echo ""
+          echo "Every unit test passed with a broken wire."
+          echo "A unit test cannot see a rename that crosses a service boundary."
+
+      - name: the provider verification MUST fail
+        working-directory: switch-service
+        env:
+          PACT_DATABASE_URL: postgres://pact:pact@localhost:5434/switch_test_db
+          PACT_REDIS_URL: redis://localhost:6380/1
+        run: |
+          if npm run pact:provider; then
+            echo "::error::THE GATE IS BROKEN. The provider verification passed with a renamed field."
+            echo "The contract testing is not protecting anything. Do not trust this pipeline."
+            exit 1
+          fi
+          echo ""
+          echo "Correct: the provider verification failed and named the missing key."
+
+      - name: can-i-deploy MUST answer NO
+        working-directory: switch-service
+        run: |
+          if npm run pact:can-i-deploy; then
+            echo "::error::THE GATE IS BROKEN. can-i-deploy said YES after a failed verification."
+            exit 1
+          fi
+          echo ""
+          echo "Correct: can-i-deploy answered NO, so a deploy job would not start."
+
+      - name: repair it, and prove the gate goes green again
+        working-directory: switch-service
+        env:
+          PACT_DATABASE_URL: postgres://pact:pact@localhost:5434/switch_test_db
+          PACT_REDIS_URL: redis://localhost:6380/1
+        run: |
+          git checkout -- src/controllers/routing.controller.ts
+          npm run pact:provider
+          npm run pact:can-i-deploy
+          echo ""
+          echo "The gate went RED on a break and GREEN again on the repair."
+          echo "That is the proof. A pipeline that only ever goes green proves nothing."
