@@ -191,9 +191,17 @@ jobs:
       - name: break the wire on purpose
         working-directory: switch-service
         run: |
-          sed -i 's/        strategy: decision.strategy,/        routingStrategy: decision.strategy,/' \
+          # Match any indentation and keep it. A pattern that hard-codes the
+          # leading spaces silently stops matching the first time the file is
+          # reformatted, and the job then proves nothing while looking busy.
+          sed -i -E 's/^( *)strategy: decision\.strategy,/\1routingStrategy: decision.strategy,/' \
             src/controllers/routing.controller.ts
-          grep -q 'routingStrategy: decision.strategy' src/controllers/routing.controller.ts
+
+          # The guard. Without it a sed that matched nothing would send this job
+          # on to "the verification must fail", the verification would pass, and
+          # the job would report THE GATE IS BROKEN when nothing was ever broken.
+          grep -q 'routingStrategy: decision.strategy' src/controllers/routing.controller.ts \
+            || { echo "::error::the break was not applied, so this job would prove nothing"; exit 1; }
           echo "renamed the response field 'strategy' to 'routingStrategy'"
 
       - name: the unit tests must still pass, which is the whole point
