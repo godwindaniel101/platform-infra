@@ -183,6 +183,28 @@ jobs:
           npm run pact:consumer
           npm run pact:publish
 
+      # FIRST, verify the HONEST code.
+      #
+      # This step is not decoration. A contract that no provider has verified
+      # yet is PENDING: pact reports a failure against it but does not fail the
+      # build, so a brand new expectation cannot break a team that has not seen
+      # it. That is the behaviour we want in real life.
+      #
+      # It also means a virgin broker cannot prove anything about the gate. One
+      # successful verification takes the contract out of pending, and only
+      # THEN is a later break fatal. Without this step the job proves the
+      # opposite of what it claims.
+      - name: verify the honest code first, to take the contract out of pending
+        working-directory: switch-service
+        env:
+          PACT_DATABASE_URL: postgres://pact:pact@localhost:5434/switch_test_db
+          PACT_REDIS_URL: redis://localhost:6380/1
+        run: |
+          npm run pact:provider
+          echo ""
+          echo "The contract is now verified for branch main, so it is no longer"
+          echo "pending. A failure from here on is fatal."
+
       # THE BREAK.
       #
       # Rename one field of the response. This is the change that looks harmless
@@ -218,13 +240,27 @@ jobs:
           PACT_DATABASE_URL: postgres://pact:pact@localhost:5434/switch_test_db
           PACT_REDIS_URL: redis://localhost:6380/1
         run: |
-          if npm run pact:provider; then
+          if npm run pact:provider 2>&1 | tee /tmp/verify.log; then
             echo "::error::THE GATE IS BROKEN. The provider verification passed with a renamed field."
             echo "The contract testing is not protecting anything. Do not trust this pipeline."
             exit 1
           fi
+
+          # It must fail for the RIGHT reason. A verification that fell over
+          # because the provider would not start would also be non-zero, and
+          # that would prove nothing at all.
+          grep -q "missing the following keys: strategy" /tmp/verify.log \
+            || { echo "::error::it failed, but not because of the renamed field"; exit 1; }
+
+          # And it must be a REAL failure, not a pending one.
+          if grep -q "non-fatal pact failures on pending" /tmp/verify.log; then
+            echo "::error::the failure was reported as PENDING, so it did not fail the build."
+            echo "The honest verification step must run first to take the contract out of pending."
+            exit 1
+          fi
+
           echo ""
-          echo "Correct: the provider verification failed and named the missing key."
+          echo "Correct: the verification failed, named the missing key, and it was fatal."
 
       - name: can-i-deploy MUST answer NO
         working-directory: switch-service
