@@ -40,6 +40,24 @@ The ports are not the usual ones. A payments laptop already runs Postgres on
 `init-db/01-databases.sql` makes four databases. Each service owns one, and
 each has a separate test database, so a test run never destroys a demo.
 
+## The broker in a real environment
+
+The compose file above runs a broker for local work and for CI. It is NOT the
+one to gate deploys against: a broker started inside a pipeline is empty, so
+`can-i-deploy` compares each version against nothing and says yes to everything.
+
+For that you need ONE long-lived broker that every pipeline talks to.
+`deploy/cloud-run/` deploys it to Cloud Run with Cloud SQL behind it, for about
+10 to 15 US dollars each month:
+
+```bash
+export GCP_PROJECT=<your-project-id>
+cd deploy/cloud-run && ./deploy.sh
+```
+
+Read `deploy/cloud-run/DEPLOY.md` first. It explains why read is authenticated
+there and public here, and why Cloud Run IAM is deliberately off.
+
 ## Set up the broker
 
 ```bash
@@ -86,7 +104,7 @@ cd ../switch-service      && npm run typecheck && npm test
 cd ../platform-infra      && npm run e2e
 ```
 
-Expect 129 unit tests, 25 integration tests, 6 contract tests and 17
+Expect 161 unit tests, 25 integration tests, 6 contract tests and 17
 scenarios.
 
 ### 2. One payout goes end to end
@@ -139,7 +157,8 @@ payout.
 This is the check that proves the contract testing is real. Everything else
 proves the code works today.
 
-In `switch-service/src/routes/route.ts`, rename one field of the response:
+In `switch-service/src/controllers/routing.controller.ts`, rename one field
+of the response:
 
 ```diff
 -        strategy: decision.strategy,
@@ -150,12 +169,17 @@ Then:
 
 ```bash
 cd switch-service
-npm run test:unit        # 95 tests still PASS. Unit tests cannot see this.
+npm run test:unit        # 101 tests still PASS. Unit tests cannot see this.
 npm run pact:provider    # FAILS: "Actual map is missing the following keys: strategy"
 npm run pact:can-i-deploy   # answers NO, and exits 1, so the deploy is blocked
 ```
 
 Put the field back and both go green again.
+
+The same proof runs automatically on every push, in
+`.github/workflows/contract-validation.yml`. That job FAILS if the gate stays
+green after the break, because a pipeline that only ever goes green tells you
+nothing about whether the check does anything.
 
 **That is the whole value of the system.** A rename that every unit test
 accepts is caught before it reaches production, in a different repository from
