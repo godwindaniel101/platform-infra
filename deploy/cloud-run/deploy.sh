@@ -15,10 +15,17 @@
 #
 set -euo pipefail
 
-PROJECT="${GCP_PROJECT:?set GCP_PROJECT to your Google Cloud project id}"
+# Defaults taken from the kuza-erp deployment, so the broker lands in the same
+# project and region as everything else.
+PROJECT="${GCP_PROJECT:-pave-504011}"
 REGION="${GCP_REGION:-europe-west1}"
 SERVICE="${BROKER_SERVICE:-pact-broker}"
-SQL_INSTANCE="${BROKER_SQL_INSTANCE:-pact-broker-db}"
+
+# SHARE the existing instance. A broker stores text and is read a few times per
+# build, so a second database server would cost real money each month to do
+# almost nothing. If kuza-pg is not there yet, this script creates it with the
+# same settings kuza-erp asks for, so whichever runs first is fine.
+SQL_INSTANCE="${BROKER_SQL_INSTANCE:-kuza-pg}"
 DB_NAME="${BROKER_DB_NAME:-pact_broker}"
 DB_USER="${BROKER_DB_USER:-pactbroker}"
 BROKER_USER="${BROKER_BASIC_AUTH_USER:-fincra}"
@@ -27,9 +34,9 @@ BROKER_USER="${BROKER_BASIC_AUTH_USER:-fincra}"
 # migrate its database when nobody asked it to.
 IMAGE="${BROKER_IMAGE:-pactfoundation/pact-broker:2.142.0-pactbroker2.120.0}"
 
-# Cloud SQL: the smallest tier is enough. A broker stores text, and it is read
-# a few times per build.
-SQL_TIER="${BROKER_SQL_TIER:-db-f1-micro}"
+# Only used if the instance has to be created. Matches kuza-erp/DEPLOY.md.
+SQL_TIER="${BROKER_SQL_TIER:-db-g1-small}"
+SQL_VERSION="${BROKER_SQL_VERSION:-POSTGRES_15}"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 
@@ -45,11 +52,12 @@ gcloud services enable \
 
 say "2/7  the Postgres instance"
 if gcloud sql instances describe "$SQL_INSTANCE" --project "$PROJECT" >/dev/null 2>&1; then
-  echo "  ${SQL_INSTANCE} is already there"
+  echo "  ${SQL_INSTANCE} is already there, so the broker shares it"
 else
+  echo "  ${SQL_INSTANCE} does not exist yet, creating it"
   # This takes several minutes the first time.
   gcloud sql instances create "$SQL_INSTANCE" \
-    --database-version=POSTGRES_16 \
+    --database-version="$SQL_VERSION" \
     --tier="$SQL_TIER" \
     --region="$REGION" \
     --storage-auto-increase \

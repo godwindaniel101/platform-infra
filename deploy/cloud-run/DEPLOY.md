@@ -8,41 +8,107 @@ Cloud Run fits that exactly:
   tunnel and no self-hosted runner
 - the only stateful part is Cloud SQL, which takes the backups
 
+## It shares the kuza-erp project
+
+The defaults come from `kuza-erp/DEPLOY.md`, so the broker lands beside
+everything else:
+
+| | |
+|---|---|
+| Project | `pave-504011` |
+| Region | `europe-west1` |
+| Cloud SQL | `kuza-pg`, **shared** |
+
+Sharing the instance is deliberate. A broker stores text and is read a few times
+per build. A second database server would cost real money each month to do
+almost nothing.
+
+If `kuza-pg` does not exist yet, the script creates it with the settings
+`kuza-erp/DEPLOY.md` asks for (`POSTGRES_15`, `db-g1-small`), so whichever
+deploy runs first is fine.
+
+Override any of it:
+
+```bash
+GCP_PROJECT=other-project BROKER_SQL_INSTANCE=its-own-instance ./deploy.sh
+```
+
 ## Before you start
 
 ```bash
-brew install --cask google-cloud-sdk    # if gcloud is not installed
+brew install --cask google-cloud-sdk    # gcloud is not installed on this machine
 gcloud auth login
-gcloud config set project <your-project-id>
 ```
+
+The account needs `roles/run.admin`, `roles/cloudsql.admin`,
+`roles/secretmanager.admin` and `roles/iam.serviceAccountUser` on
+`pave-504011`. The `deployer@` service account that kuza-erp already uses has
+all of these except `cloudsql.admin`, which it does not need because it never
+creates instances.
 
 ## Deploy
 
 ```bash
-export GCP_PROJECT=<your-project-id>
-export GCP_REGION=europe-west1          # or africa-south1, or wherever you run
+cd platform-infra/deploy/cloud-run
 ./deploy.sh
 ```
 
-The first run takes about ten minutes, nearly all of it waiting for Cloud SQL.
-Run it again whenever you want to change something: every step checks first, so
-a second run is safe.
+The defaults are already the kuza-erp project and region, so there is nothing to
+export.
+
+If `kuza-pg` already exists this takes about two minutes. If it has to be created
+it takes about ten, nearly all of it waiting for Cloud SQL.
+
+Run it again whenever you want to change something: every step checks first, so a
+second run is safe.
 
 ## What it creates
 
 | Thing | Name | Note |
 |-------|------|------|
 | Cloud Run service | `pact-broker` | public HTTPS, scales to zero |
-| Cloud SQL instance | `pact-broker-db` | Postgres 16, `db-f1-micro`, daily backup at 02:00 |
-| Database | `pact_broker` | |
+| Database | `pact_broker` on `kuza-pg` | a database, not a new server |
+| Database user | `pactbroker` | its own credentials |
 | Secret | `pact-broker-db-password` | generated, never printed |
 | Secret | `pact-broker-basic-auth-password` | generated, printed once at the end |
 
+It creates the Cloud SQL INSTANCE only if `kuza-pg` is missing.
+
+## Lock the database user down
+
+**Do this once, and do not skip it.**
+
+Postgres lets any user connect to any database on the instance by default. The
+broker shares an instance with the ERP, so without this the `pactbroker` user
+can open `erp_db` and `erp_landlord`.
+
+Connect as the admin user and run:
+
+```sql
+REVOKE CONNECT ON DATABASE erp_db       FROM PUBLIC;
+REVOKE CONNECT ON DATABASE erp_landlord FROM PUBLIC;
+REVOKE CONNECT ON DATABASE pact_broker  FROM PUBLIC;
+
+GRANT CONNECT ON DATABASE pact_broker TO pactbroker;
+-- and grant the ERP user its own two, if PUBLIC was the only grant it had
+```
+
+The easiest way in:
+
+```bash
+gcloud sql connect kuza-pg --user=postgres --project=pave-504011
+```
+
+Check it worked: connecting as `pactbroker` to `erp_db` must be refused.
+
 ## Cost
 
-Roughly **10 to 15 US dollars each month**, nearly all of it the Cloud SQL
-instance. Cloud Run itself is close to nothing: a broker is read a few times per
-build and sleeps between them.
+**Close to nothing on top of what kuza-erp already pays**, because the database
+server is shared. Cloud Run scales to zero, and a broker is read a few times per
+build.
+
+If the instance has to be created, that is roughly **25 to 30 US dollars each
+month** for a `db-g1-small` — but then kuza-erp needs it anyway.
 
 For comparison, the PactFlow Team plan is 127 dollars each month and caps at 50
 integrations. The saving grows with every service you add.
@@ -112,9 +178,12 @@ public read is still on and anyone can read your contracts.
 Cloud SQL takes a daily backup at 02:00. To list and restore:
 
 ```bash
-gcloud sql backups list --instance=pact-broker-db
-gcloud sql backups restore <backup-id> --restore-instance=pact-broker-db
+gcloud sql backups list --instance=kuza-pg
+gcloud sql backups restore <backup-id> --restore-instance=kuza-pg
 ```
+
+Restoring the shared instance restores the ERP databases too. Treat a broker
+restore as an ERP event, not a small one.
 
 Losing the broker database is not an emergency: every contract can be published
 again from the consumer builds. What you lose is the deployment history, and
