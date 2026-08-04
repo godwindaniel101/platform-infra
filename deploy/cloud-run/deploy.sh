@@ -23,9 +23,9 @@ SERVICE="${BROKER_SERVICE:-pact-broker}"
 
 # SHARE the existing instance. A broker stores text and is read a few times per
 # build, so a second database server would cost real money each month to do
-# almost nothing. If kuza-pg is not there yet, this script creates it with the
+# almost nothing. If the instance is not there yet, this script creates it with the
 # same settings kuza-erp asks for, so whichever runs first is fine.
-SQL_INSTANCE="${BROKER_SQL_INSTANCE:-kuza-pg}"
+SQL_INSTANCE="${BROKER_SQL_INSTANCE:-kuza}"
 DB_NAME="${BROKER_DB_NAME:-pact_broker}"
 DB_USER="${BROKER_DB_USER:-pactbroker}"
 BROKER_USER="${BROKER_BASIC_AUTH_USER:-fincra}"

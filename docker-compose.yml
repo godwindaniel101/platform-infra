@@ -67,10 +67,16 @@ services:
       PACT_BROKER_LOG_LEVEL: INFO
       PACT_BROKER_WEBHOOK_HOST_WHITELIST: "host.docker.internal localhost 127.0.0.1"
     healthcheck:
+      # 127.0.0.1, never "localhost".
+      #
+      # Inside this container "localhost" resolves to ::1 first, and the broker
+      # binds IPv4 only, so wget gets "connection refused" and the container
+      # reports unhealthy forever while the application is perfectly fine.
+      # "docker compose ps" then lies, and somebody spends an afternoon on it.
       test:
         [
           "CMD-SHELL",
-          "wget -q -O - http://localhost:9292/diagnostic/status/heartbeat || exit 1",
+          "wget -q -O - http://127.0.0.1:9292/diagnostic/status/heartbeat || exit 1",
         ]
       interval: 5s
       timeout: 5s
