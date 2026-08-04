@@ -1,368 +1,329 @@
-# Contract testing for `fincra-disbursements` ↔ `fincra-integrations`
+# Integration-test plan for the switch-engine path
 
-An implementation plan, written against the code as it stands on `main` on
-2026-08-04.
+`fincra-disbursements` ↔ `fincra-switching-engine` (V2 and DYNA)
 
-Everything below was read from shallow clones of `FincraNG/fincra-disbursements`
-and `FincraNG/fincra-integrations`. Nothing was run. Where a claim is a
-judgement rather than something read from the source, it says so.
+Written against `main` of both repositories on 2026-08-04, from source. Nothing
+was run. Where a statement is judgement rather than something read from the
+code, it says so.
 
 ---
 
-## 1. What the boundary actually is
+## 0. Correction to the first version of this document
 
-The two services meet at **one endpoint**:
+The first version planned the **`fincra-disbursements` ↔ `fincra-integrations`**
+boundary: the `POST /integration/gateway` action-dispatch endpoint. That is a
+real boundary and section 7 keeps the findings, but it is **not the switch-engine
+path** and it was the wrong target for this goal.
+
+The switch-engine path is the one that mirrors the proof of concept almost
+exactly, and it is a considerably better first target. Section 2 says why.
+
+---
+
+## 1. The three boundaries
+
+Disbursements talks to the switching engine in three separate ways. Each needs a
+different kind of test.
+
+### A. Synchronous route, V2 (live)
 
 ```
-POST {INTEGRATIONS_SERVICE_BASE_URL}/integration/gateway
+POST {SWITCHING_ENGINE_SERVICE_BASE_URL}/v2/route
 ```
 
-It is not REST. It is an action-dispatch gateway:
+`src/components/disbursements/payouts/repos/PayoutsUtilRepository.ts:1109`
 
-```jsonc
-// request
-{ "channelName": "rave", "action": "getDisbursement", "data": { "reference": "..." } }
+The comment in `switchEventsProducer.ts` calls this "Stage 1", and says it "stays
+synchronous HTTP" while stages 2 and 3 moved to a queue.
 
-// success
-{ "success": true, "data": { /* whatever that channel returned */ } }
+### B. Synchronous DYNA, HMAC-signed (shadow)
+
+```
+POST {DYNA_SWITCH_SERVICE_BASE_URL}/api/route-decisions
+POST {DYNA_SWITCH_SERVICE_BASE_URL}/api/attempt-outcome-events
 ```
 
-| Side | Where |
+| Client | File |
 |---|---|
-| Route | `fincra-integrations/src/routes/gateway.ts` |
-| Controller | `fincra-integrations/src/controller/gateway.ts` |
-| Inbound schema | `fincra-integrations/src/validation/gateway.ts` |
-| Dispatch | `channelService.initiateChannel(req.body)` |
+| Route decision | `payouts/services/dynaRouteClient.ts` |
+| Attempt outcome | `payouts/services/dynaAttemptOutcomeClient.ts` |
+| Decision lifecycle | `payouts/services/dynaDecisionLifecycleClient.ts` |
 
-The inbound Joi schema is the whole of the declared contract today:
+The paths are already exported as constants, and the reason given in
+`dynaRouteClient.ts:13` is worth quoting:
 
-```ts
-channelName: Joi.string().required(),
-channelEntityName: Joi.string().optional(),
-action: Joi.string().required(),
-data: Joi.object().optional(),
-```
+> *The exact bytes used in the URL and HMAC canonical request. Exported so the
+> cross-contract gate cannot accidentally freeze a different versioned path.*
 
-`data` is `Joi.object()`. **The payload that carries the money is unvalidated
-and untyped on both sides.**
+**Somebody has already designed for a cross-contract gate.** This plan is
+finishing a thought that repository started, not introducing a new one.
 
-### The five call sites
-
-| File | Line | Purpose |
-|---|---|---|
-| `src/components/disbursements/disbursementsRepository.ts` | 254 | `callChannelViaGateway` |
-| `src/components/disbursements/disbursementsRepository.ts` | 770 | `uploadTransactionDocument` |
-| `src/components/disbursements/disbursementsRepository.ts` | 793 | `getChannelStatus` |
-| `src/components/disbursements/payouts/repos/PayoutsUtilRepository.ts` | 955 | payout path |
-| `src/components/transactionStatusQuery/transactionStatusQueryRepository.ts` | 20 | status query |
-
-Each one builds its own `axios.post` or `httpService.post`. There is no client
-class, no shared type, and the argument is `data: any`.
-
-### The surface, counted
-
-Actions sent by disbursements (from `action: "..."` literals):
-
-```
-initiate  getDisbursement  disbursement  settlement  disburse  verifyTransaction
-validateDisbursement  run  getWithdrawal  getPayoutStatus  fetchTransfer
-conversion  authenticate
-```
-
-Channels named by disbursements:
-
-```
-clearJunction  complyAdvantage  globus  korapay  mfsAfrica
-nedbank  opay  quidax  rave
-```
-
-13 actions × 9 channels is **not** 117 contracts, because most pairs do not
-exist. But it is the reason this cannot be done as one interaction and declared
-finished.
-
-`fincra-integrations/src/deccs/gate.ts` already names the money path:
+Authentication is HMAC over method, path and a SHA-256 of the body, and
+production refuses anything else:
 
 ```ts
-const CLASSIFIED_ACTIONS = new Set(["disburse", "gettransactions", "getdisbursement"]);
+if (production && configured !== "hmac") {
+  throw new Error("Dyna HMAC authentication is required in production");
+}
 ```
 
-**Use that same set.** Those three actions are where a contract break costs
-money. Start there and nowhere else.
+### C. Asynchronous events over SQS (live)
+
+Queue: `SWITCH_ROUTER_EVENTS_QUEUE_URL`
+Producer: `payouts/repos/switchEventsProducer.ts`
+
+The message is already a typed discriminated union:
+
+```ts
+export type SwitchEventMessage =
+  | { type: "channel-event";
+      providerKey: string; transactionId: string;
+      event: "accepted" | "rejected";
+      rejectedType?: "timeout" | "infra-failure" | "business-failure";
+      latencyMs: number }
+  | { type: "transaction-outcome";
+      providerKey: string; transactionId: string;
+      status: "success" | "failed" };
+```
+
+The file's own comment states the consumer: *"The switch drains this queue
+in-process and feeds its existing record handlers."*
 
 ---
 
-## 2. Why the demo repositories do not transfer directly
+## 2. Why this path, and not the integrations gateway
 
-The `disbursement-service` / `switch-service` pair proved the mechanism. Four
-things are different here, and each one changes the work.
+The integrations gateway needed a refactor before a single contract test could be
+written: five scattered `axios.post` calls, `data: any`, no client. The
+switch-engine path needs none of that.
 
-**One endpoint, many logical operations.** A pact interaction is
-request-plus-response. Here the request is distinguished by `channelName` and
-`action` inside the body, not by path or method. Every interaction must fix
-those two values exactly and match the rest loosely. Provider states become
-`"channel rave supports getDisbursement and the transaction is successful"`.
+| Needed | Integrations gateway | Switch-engine path |
+|---|---|---|
+| A typed client to test | **absent** — must be built first | **present** — three of them |
+| A stable, versioned path | none, dispatch is in the body | `/v2/route`, `/api/route-decisions` |
+| A typed payload | `data: any` | `DynaRouteDecisionV2`, `SwitchEventMessage` |
+| An established test lane | `*.gate.spec.ts` exists | same, plus 21 dyna gate specs |
+| Carrying money today | yes | **`/v2/route` yes, DYNA no** |
 
-**There is nothing to write a consumer test against.** The demo had a
-`SwitchClient` class. Here the call is `axios.post(url, data)` with `data: any`
-in five places. A consumer pact test asserts that *the client can read the
-response*; with no client there is nothing to assert on. **This is the single
-biggest blocker, and it is a refactor, not a test.**
+The last row is the strongest argument, and it is time-limited.
 
-**The response is passed through, not parsed.** The gateway returns whatever the
-partner returned. Disbursement then maps `data` onto the payout — channel
-reference and status. That mapping is the real contract, and it is currently
-implicit. The fields that matter are the ones the payout reads.
+`payouts/services/dynaAuthorityContracts.ts` freezes the current release as:
 
-**A live gate already exists, and it is additive.** DECCS appends `mappedError`
-to gateway responses (`src/deccs/gate.ts`). Any contract must treat it as
-**optional**, or turning DECCS on and off will break the contract test for a
-reason unconnected to the wire.
+```ts
+export const DYNA_RELEASE_CAPABILITY = Object.freeze({
+  routing: "shadow_only",
+  profileResolution: "evidence_only",
+  decisionLifecycle: "dormant",
+  attemptOutcome: "dormant",
+  authority: false,
+});
+```
+
+**DYNA is in shadow mode. It does not yet carry money.** Contract tests written
+now become the definition of the wire *before* the switch is given authority.
+Written later, they document whatever the two services drifted into. This window
+closes when `authority` becomes `true`.
+
+### The proof of concept maps onto this almost exactly
+
+| Proof of concept | Switch-engine path |
+|---|---|
+| `POST /route`, disbursement to switch | `POST /v2/route`, `POST /api/route-decisions` |
+| Outcome over a Redis stream | `transaction-outcome` over SQS |
+| Transactional outbox for the outcome | the dyna route outbox (`dynaRouteOutboxPolicy`) |
+| Switch keeps a sliding window | the switch's own record handlers |
+| HTTP pact plus one message pact | the same two shapes, times three boundaries |
+
+Both pact pairs built in the proof of concept transfer directly. The synchronous
+route is an HTTP pact; the SQS event is a message pact.
 
 ---
 
-## 3. What already exists, and should be used
+## 3. What to contract-test, in order
 
-Do not build a parallel structure. Both repositories already have what is
-needed.
+Not everything. Contract-test what breaks money when it drifts.
 
-| Asset | Where | Use it for |
-|---|---|---|
-| `*.gate.spec.ts` lane, vitest, 58 specs | `fincra-disbursements/vitest.config.ts` | The lane the pact tests join |
-| `test:gate` script | both `package.json` | The command CI already runs |
-| `channelMock` | `fincra-integrations/src/shared/channelMock/` | **Provider states** |
-| `test.yml` on push and pull request | both `.github/workflows/` | Where the gate hooks in |
-| `dev.yml`, `sandbox.yml`, `tag.yaml` | both | What the gate must block |
+| # | Interaction | Type | Why first |
+|---|---|---|---|
+| 1 | `POST /api/route-decisions` | HTTP | Typed client exists, shadow mode, zero risk |
+| 2 | `transaction-outcome` on SQS | Message | Two words wrong here and the switch learns a lie |
+| 3 | `channel-event` on SQS | Message | Same producer, near-zero extra cost |
+| 4 | `POST /api/attempt-outcome-events` | HTTP | Completes the DYNA loop |
+| 5 | `POST /v2/route` | HTTP | **Live money. Do this last, after the pattern is proven.** |
 
-`channelMock` deserves attention. It already:
-
-- flips channel outcomes live from general-config, with no redeploy
-- refuses to engage when `NODE_ENV === "production"`
-- forces an explicit body for success outcomes, because a synthetic body would
-  give a payout a garbage reference
-
-That is a provider-state mechanism that someone has already thought hard about.
-A pact provider state handler should set a `channelMock` rule and clear it
-afterwards. **Do not write a second mocking layer.**
+Deliberately excluded for now: `dynaDecisionLifecycleClient` (dormant), and every
+read that no money-path decision consumes.
 
 ---
 
 ## 4. The plan
 
-Five stages. Each one is shippable on its own and leaves the system better than
-it found it. Stop after any stage and nothing is half-built.
+Four stages. Each is shippable alone.
 
-### Stage 0 — Give the boundary a client (no pact yet)
+### Stage 1 — Broker, and one message pact
 
-**This is the prerequisite. Nothing else is possible without it.**
+Start with the **SQS `transaction-outcome` event**, not the HTTP route. Three
+reasons: the type is already a discriminated union, the producer is one small
+file, and a message pact needs no running provider and no HMAC.
 
-Add `src/clients/integrationsGateway/` to `fincra-disbursements`:
-
-```ts
-// The one place this service talks to fincra-integrations.
-export interface GatewayRequest<TData = unknown> {
-  channelName: string;
-  channelEntityName?: string;
-  action: string;
-  data?: TData;
-}
-
-export interface GatewayResponse<TData = unknown> {
-  success: boolean;
-  data: TData;
-  mappedError?: MappedError;   // DECCS, additive, may be absent
-}
-
-export class IntegrationsGatewayClient {
-  async call<TReq, TRes>(req: GatewayRequest<TReq>): Promise<GatewayResponse<TRes>>;
-}
-```
-
-Rules for the client, all of which the current code lacks in at least one place:
-
-1. **Validate the response before any business logic reads it.** A partner can
-   answer HTTP 200 with the failure in the body, and this codebase already knows
-   that — `isPayoutNotInitiatedError` exists at
-   `disbursementsRepository.ts:270`. Move that class of check into the client.
-2. **One timeout, from `INTEGRATIONS_TIMEOUT_IN_SECONDS`.** Today the fallback
-   `70000` is written inline at the call site.
-3. **Type the money-path actions.** `disburse`, `getDisbursement`,
-   `verifyTransaction` get named request and response types. The rest may stay
-   `unknown` until they are needed.
-4. **Do not change behaviour.** Move the five call sites onto the client and
-   nothing else.
-
-Value even if the plan stops here: one place to change a timeout, one place to
-add a retry, one place to read.
-
-Effort: judgement, roughly two to three days including moving the call sites.
-
-### Stage 1 — Stand up the broker
-
-A shared, long-lived Pact Broker. The full deployment is in
-`platform-infra/deploy/cloud-run/`, already proven against a real project.
-
-Decisions to make before deploying:
-
-- **Where.** Cloud Run costs about ten to fifteen US dollars each month and is
-  reachable from GitHub-hosted runners. Anything inside the VPC needs
-  self-hosted runners, or every gate silently skips.
-- **Read is authenticated.** `PACT_BROKER_ALLOW_PUBLIC_READ=false`. A contract
-  states the shape of a payment API, field by field.
-- **One broker for all seventeen services**, not one per pair. That is the whole
-  point of a broker.
-
-Effort: half a day, most of it waiting.
-
-### Stage 2 — One interaction, end to end
-
-Pick **`getDisbursement` on one channel**. It is a read, so a wrong move costs
-nothing, and it exercises the full loop.
-
-Consumer side, in `fincra-disbursements`, joining the existing lane as
-`integrationsGateway.pact.spec.ts`:
+Consumer side is `fincra-switching-engine` — **the switch is the consumer of the
+event, because it reads it.** The direction of a contract follows the data, not
+the call. Disbursements is the provider even though it does the sending.
 
 ```ts
-provider
-  .given("channel rave has a successful disbursement for the reference")
-  .uponReceiving("a request for the status of a disbursement")
-  .withRequest({
-    method: "POST",
-    path: "/integration/gateway",
-    body: {
-      channelName: "rave",              // exact: it selects the channel
-      action: "getDisbursement",        // exact: it selects the operation
-      data: { reference: like("FCR-123") },
-    },
-  })
-  .willRespondWith({
-    status: 200,
-    body: {
-      success: boolean(true),
-      data: {
-        // ONLY the fields the payout actually reads. Nothing else.
-        status: regex(/^(successful|failed|pending)$/, "successful"),
-        reference: like("FCR-123"),
-      },
-    },
-  });
+// in fincra-switching-engine, joining its own test lane
+.given("a payout succeeded on providerKey X")
+.expectsToReceive("a transaction outcome")
+.withContent({
+  type: string("transaction-outcome"),      // exact: it selects the handler
+  providerKey: like("providus"),
+  transactionId: like("..."),
+  status: regex(/^(success|failed)$/, "success"),
+})
 ```
 
-The rule that keeps this maintainable: **put in the contract only the fields
-this service reads.** The gateway passes through whatever the partner sent. If
-the contract lists every field a partner happens to return, then a partner
-changing an unread field breaks a Fincra build for no reason.
+Provider side in disbursements calls the real producer. Keep the message
+**building** separate from the **sending**, exactly as `buildOutcomeEvent` was
+kept separate from the Redis write in the proof of concept. If
+`switchEventsProducer` builds and sends in one function, split it first — that is
+a ten-line change, and without it the message pact needs SQS.
 
-Provider side, in `fincra-integrations`, with the state handler setting a
-`channelMock` rule and clearing it in teardown.
+Broker: `platform-infra/deploy/cloud-run/`, already proven. One shared broker for
+all seventeen services.
 
-Effort: judgement, roughly three to four days for the first one, because it
-includes learning. Later ones are hours.
+Effort: judgement, three to four days including the broker and the first-time
+learning.
 
-### Stage 3 — Turn the gate on, in warn mode first
+### Stage 2 — The DYNA route decision, with HMAC
 
-Add `contract-gate` to `test.yml` in both repositories. **For the first two
-weeks it must not fail the build.** Run it, publish, and let people watch it.
-A gate that fails on the day it lands gets switched off in a week.
+The one genuinely new problem in this plan.
 
-Then, and only then, make the deploy workflows (`dev.yml`, `sandbox.yml`,
-`tag.yaml`) depend on it. That single dependency is the entire mechanism.
+The request carries a signature over method, path and a SHA-256 of the body. Two
+consequences:
 
-Two settings that are not optional:
+1. **In the consumer pact, match the signature header by type, never by value.**
+   Its value depends on the body bytes, which pact matchers deliberately vary.
+   `Authorization: like("...")`, and assert the *presence* of the header.
+2. **In the provider verification, HMAC must be satisfiable.** Run the provider
+   with `DYNA_SWITCH_AUTH_MODE=hmac` and a **test key pair**, and give the
+   consumer test the same key so it signs what the provider will accept. Do not
+   set `bearer` for the test: the production guard exists precisely because the
+   modes differ, and verifying the mode production does not use proves little.
 
-- **`enablePending: true`.** A new expectation must not break a provider that
-  has never seen it. Beware the consequence: a contract nobody has verified yet
-  reports failures but does not fail the build. It becomes fatal only after the
-  first successful verification.
-- **Webhooks.** Without one, a consumer change never triggers the provider
-  build, `can-i-deploy` answers "unknown" forever, and someone removes the gate.
+The paths are already constants (`DYNA_ROUTE_DECISIONS_PATH`), so the pact should
+import them rather than repeat the string. That is what the comment about the
+"cross-contract gate" was anticipating.
+
+Effort: judgement, three days, most of it on the HMAC fixture.
+
+### Stage 3 — Gate on, warn mode first
+
+Add `contract-gate` to `test.yml` in both repositories, and **do not let it fail
+the build for the first two weeks.** Then make `dev.yml`, `sandbox.yml` and
+`tag.yaml` depend on it. That dependency is the whole mechanism.
+
+`enablePending: true` and a broker webhook are both required. Without the
+webhook, a consumer change never triggers the provider build, `can-i-deploy`
+answers "unknown" forever, and someone removes the gate.
 
 Effort: two days, then two weeks of watching.
 
-### Stage 4 — Widen to the rest of the money path
+### Stage 4 — `/v2/route`, the live money path
 
-Add `disburse` and `verifyTransaction`. Then the channels that actually carry
-volume, which the team knows and this document does not.
+Only after stages 1 to 3 are boring. `/v2/route` carries real payouts today, and
+`PayoutsUtilRepository.ts` is a large file; expect the response shape to be read
+in more places than a first reading suggests.
 
-**Do not aim for coverage of all 13 actions.** Contract-test what breaks money
-when it drifts. `getBanks` and `getBalance` do not need a pact.
+Put in the contract only the fields a payout actually consumes — the provider key
+and the decision. A contract listing every field the switch happens to return
+breaks a build every time the switch adds an unread field.
 
----
-
-## 5. Wiring into the existing CI
-
-Both repositories run `test.yml` on pull request and on push to `dev` and
-`main`. Deploys are separate workflows.
-
-```
-test.yml            (exists)  →  contract-gate  →  dev.yml / sandbox.yml / tag.yaml
-```
-
-The gate itself should be one script, `ci/contract-gate.sh`, so it runs the same
-way on a laptop as in CI. A gate that only exists inside a YAML file cannot be
-tested and nobody can run it before they push.
-
-Secrets needed in both repositories: `PACT_BROKER_BASE_URL`,
-`PACT_BROKER_USERNAME`, `PACT_BROKER_PASSWORD`.
-
-The version is the git SHA. The branch is the git branch. Never write a version
-in code.
+Effort: judgement, one week, mostly reading.
 
 ---
 
-## 6. Things that will bite, all seen in practice
+## 5. Reuse, do not rebuild
 
-These cost real time on the proof-of-concept. Each one fails with a message that
-points somewhere else.
+| Asset | Where | Use for |
+|---|---|---|
+| `*.gate.spec.ts` lane, vitest, 58 specs | `fincra-disbursements/vitest.config.ts` | The lane pact specs join |
+| 21 `dyna*.gate.spec.ts` | `payouts/services/__tests__/` | The conventions to copy |
+| Exported path constants | `dynaRouteClient.ts` | Import into the pact, never retype |
+| `DYNA_RELEASE_CAPABILITY` | `dynaAuthorityContracts.ts` | The shadow-mode guard already exists |
+| `channelMock` | `fincra-integrations` | Provider states, if the gateway is done later |
+| `test.yml` | both `.github/workflows/` | Where the gate hooks in |
+
+---
+
+## 6. Things that will bite
+
+Each of these was met while proving the mechanism end to end. Each fails with a
+message pointing somewhere else.
 
 | Symptom | Cause |
 |---|---|
-| `No pacts found matching the given consumer version selectors`, while every contract is present | The pacticipant's `mainBranch` is unset. `PUT /pacticipants` replaces the record and erases it. Use `POST` to create and `PATCH` to amend. |
-| `can-i-deploy` says YES for a version nobody published | An empty matrix reports `deployable: true`, because nothing is missing when nothing is expected. Treat zero rows as a failure. |
-| `can-i-deploy` against an environment can never pass | Nothing is recorded as deployed there yet, and only a deploy can record it. Fall back to the main-branch comparison until the first deploy is recorded. |
-| `record-deployment` returns 404 "document not found" | That endpoint takes the environment **UUID**, not its name. Read `pb:record-deployment` off the version resource. |
-| The gate fails slowly and blames the wrong thing | A retry loop that re-asks a different question than the one it fell back to. |
-| A provider verification fails but does not fail the build | The contract is still pending. Pending ends after the first successful verification. |
-| A break test poisons everyone's gate | It was run against the shared broker. The failed verification lands on `main` and blocks every other service. Run it against a broker started inside the pipeline. |
+| `No pacts found matching the given consumer version selectors`, contracts all present | The pacticipant's `mainBranch` is unset. `PUT /pacticipants` replaces the record and erases it. `POST` to create, `PATCH` to amend. |
+| `can-i-deploy` says YES for a version nobody published | An empty matrix reports `deployable: true`. Treat zero rows as failure. |
+| `can-i-deploy` against an environment can never pass | Nothing is recorded as deployed there, and only a deploy records it. Fall back to the main branch until the first record. |
+| `record-deployment` 404 "document not found" | The endpoint takes the environment **UUID**, not its name. |
+| The gate fails slowly and blames the wrong thing | A retry loop re-asking a different question than the one it fell back to. |
+| A verification fails but does not fail the build | The contract is still pending. Pending ends after the first successful verification. |
+| A break test poisons everyone's gate | It ran against the shared broker. Use a broker started inside the pipeline. |
+| The signature never matches | The pact matcher varied the body after the signature was computed. Match the header by type. |
 
 ---
 
-## 7. What this will not do
+## 7. The integrations gateway, kept for later
 
-State these before starting, so nobody expects them.
+Findings from the first version of this document. A real boundary, worth doing
+after the switch-engine path.
 
-- **It does not test behaviour.** It tests the shape of the wire. Whether a
-  payout actually reaches the bank is an end-to-end question.
-- **It does not test the partners.** The contract is between two Fincra
-  services. Providus changing its API is a different problem, which
-  `channelMock` and DECCS already address.
-- **It does not replace the existing gate specs.** The 58 `*.gate.spec.ts` files
-  test invariants that no contract test can see.
-- **It does not remove the need for `data: any` to become typed.** Contract
-  testing makes the untyped payload visible; it does not fix it.
+- One endpoint: `POST {INTEGRATIONS_SERVICE_BASE_URL}/integration/gateway`, body
+  `{ channelName, action, data }`, dispatching on `action`.
+- The inbound Joi schema declares `data: Joi.object()`. **The payload that
+  carries the money is unvalidated and untyped on both sides.**
+- Five call sites, each building its own `axios.post` with `data: any`:
+  `disbursementsRepository.ts` 254, 770, 793; `PayoutsUtilRepository.ts` 955;
+  `transactionStatusQueryRepository.ts` 20.
+- 13 actions, 9 channels. `deccs/gate.ts` already names the money path:
+  `disburse`, `gettransactions`, `getdisbursement`. Use that set.
+- DECCS appends `mappedError` additively, so a contract must treat it as
+  optional.
+- **Stage 0 for that path is a client refactor, not a test.** It is worth doing
+  regardless: today the timeout fallback is inline at a call site, and the
+  "HTTP 200 with the failure in the body" check exists in one call path only.
 
 ---
 
-## 8. Suggested order and rough effort
+## 8. What this will not do
 
-Effort figures are a judgement from reading the code, not a measurement.
+- It does not test behaviour. Whether the switch picks a good provider is an
+  end-to-end question.
+- It does not test the partners. Providus changing its API is a different
+  problem, which `channelMock` and DECCS already address.
+- It does not replace the 58 gate specs, which test invariants no contract test
+  can see.
+- It does not remove the HMAC risk. A contract test proves the shape crosses; it
+  does not prove the signature is right in production.
+
+---
+
+## 9. Order and effort
+
+Effort is judgement from reading the code, not measurement.
 
 | Stage | Work | Rough effort | Value if you stop here |
 |---|---|---|---|
-| 0 | One client for the gateway | 2–3 days | One place to change a timeout or a retry |
-| 1 | Broker on Cloud Run | 0.5 day | Ready for every other service too |
-| 2 | First interaction, both sides | 3–4 days | Proof on the real boundary |
-| 3 | Gate in warn mode, then blocking | 2 days + 2 weeks | Drift becomes visible, then blocked |
-| 4 | `disburse`, `verifyTransaction`, volume channels | 1–2 days each | The money path is covered |
+| 1 | Broker + `transaction-outcome` message pact | 3–4 days | The event the switch learns from is pinned |
+| 2 | `/api/route-decisions` with HMAC | 3 days | The DYNA wire is pinned before it gets authority |
+| 3 | Gate in warn mode, then blocking | 2 days + 2 weeks | Drift visible, then blocked |
+| 4 | `/v2/route`, live money | 1 week | The live path is covered |
 
-Stage 0 is worth doing whatever is decided about contract testing.
+## 10. The one time-sensitive point
 
----
+**Do stage 2 before `DYNA_RELEASE_CAPABILITY.authority` becomes `true`.**
 
-## 9. The first decision
-
-**Do stages 0 and 1 in parallel.** They do not depend on each other, and both
-have standalone value. Stage 0 needs a disbursements engineer; stage 1 needs
-someone with GCP access for half a day.
-
-Nothing after that should start until stage 0 is merged, because there is
-nothing to write a consumer test against until there is a client.
+While DYNA is `shadow_only` a contract test costs nothing to get wrong and
+defines the wire before it carries money. After authority is granted, the same
+test is archaeology on a live money path. That window is the single best reason
+to start now rather than after the next release.
