@@ -41,6 +41,12 @@ const PAIRS = [
 
 const ENVIRONMENTS = ['local', 'staging', 'production']
 
+/** The branch that `mainBranch: true` selectors resolve against. */
+const MAIN_BRANCH = process.env.PACT_MAIN_BRANCH ?? 'main'
+
+/** Every service the broker needs to know about, taken from the pairs. */
+const PACTICIPANTS = [...new Set(PAIRS.flatMap((p) => [p.consumer, p.provider]))]
+
 async function brokerFetch(path, init = {}) {
   const response = await fetch(`${BROKER}${path}`, {
     ...init,
@@ -160,6 +166,48 @@ async function main() {
 
   console.log('\nenvironments (can-i-deploy needs these):')
   for (const name of ENVIRONMENTS) await ensureEnvironment(name)
+
+  // A webhook names a consumer and a provider, and the broker refuses one that
+  // names a pacticipant it has never heard of. On a fresh broker nothing exists
+  // until the first contract is published, so make sure they exist here.
+  //
+  // NEVER use PUT for this. PUT REPLACES the pacticipant, and a body of just
+  // { name } silently erases its `mainBranch`. Every consumer version selector
+  // that says `mainBranch: true` then resolves to nothing, the provider
+  // verification reports "No pacts found matching the given consumer version
+  // selectors", and can-i-deploy goes unknown. Nothing in the message points at
+  // the cause, and the contract files are all still there.
+  //
+  // Create only what is missing, and always state the main branch.
+  console.log('\npacticipants:')
+  for (const name of PACTICIPANTS) {
+    const existing = await brokerFetch(`/pacticipants/${encodeURIComponent(name)}`)
+    if (existing.ok) {
+      if (existing.body?.mainBranch) {
+        console.log(`  ${name} exists, main branch ${existing.body.mainBranch}`)
+        continue
+      }
+      // It exists but has no main branch. PATCH only touches what it names.
+      const fixed = await brokerFetch(`/pacticipants/${encodeURIComponent(name)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ mainBranch: MAIN_BRANCH }),
+      })
+      console.log(
+        fixed.ok
+          ? `  ${name} had no main branch, set to ${MAIN_BRANCH}`
+          : `  ${name} main branch could not be set (${fixed.status})`,
+      )
+      continue
+    }
+
+    const created = await brokerFetch('/pacticipants', {
+      method: 'POST',
+      body: JSON.stringify({ name, mainBranch: MAIN_BRANCH }),
+    })
+    console.log(
+      created.ok ? `  ${name} created` : `  ${name} failed (${created.status})`,
+    )
+  }
 
   console.log('\nwebhooks:')
   for (const pair of PAIRS) {

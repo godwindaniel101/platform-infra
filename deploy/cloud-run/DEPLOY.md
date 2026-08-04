@@ -17,13 +17,13 @@ everything else:
 |---|---|
 | Project | `pave-504011` |
 | Region | `europe-west1` |
-| Cloud SQL | `kuza-pg`, **shared** |
+| Cloud SQL | `kuza` (Postgres 18), **shared** |
 
 Sharing the instance is deliberate. A broker stores text and is read a few times
 per build. A second database server would cost real money each month to do
 almost nothing.
 
-If `kuza-pg` does not exist yet, the script creates it with the settings
+If the instance does not exist yet, the script creates it with the settings
 `kuza-erp/DEPLOY.md` asks for (`POSTGRES_15`, `db-g1-small`), so whichever
 deploy runs first is fine.
 
@@ -67,12 +67,12 @@ second run is safe.
 | Thing | Name | Note |
 |-------|------|------|
 | Cloud Run service | `pact-broker` | public HTTPS, scales to zero |
-| Database | `pact_broker` on `kuza-pg` | a database, not a new server |
+| Database | `pact_broker` on `kuza` | a database, not a new server |
 | Database user | `pactbroker` | its own credentials |
 | Secret | `pact-broker-db-password` | generated, never printed |
 | Secret | `pact-broker-basic-auth-password` | generated, printed once at the end |
 
-It creates the Cloud SQL INSTANCE only if `kuza-pg` is missing.
+It creates the Cloud SQL INSTANCE only if `kuza` is missing.
 
 ## Lock the database user down
 
@@ -80,14 +80,14 @@ It creates the Cloud SQL INSTANCE only if `kuza-pg` is missing.
 
 Postgres lets any user connect to any database on the instance by default. The
 broker shares an instance with the ERP, so without this the `pactbroker` user
-can open `erp_db` and `erp_landlord`.
+can open `kuza_erp` and `kuza_erp_landlord`.
 
 Connect as the admin user and run:
 
 ```sql
-REVOKE CONNECT ON DATABASE erp_db       FROM PUBLIC;
-REVOKE CONNECT ON DATABASE erp_landlord FROM PUBLIC;
-REVOKE CONNECT ON DATABASE pact_broker  FROM PUBLIC;
+REVOKE CONNECT ON DATABASE kuza_erp           FROM PUBLIC;
+REVOKE CONNECT ON DATABASE kuza_erp_landlord FROM PUBLIC;
+REVOKE CONNECT ON DATABASE pact_broker        FROM PUBLIC;
 
 GRANT CONNECT ON DATABASE pact_broker TO pactbroker;
 -- and grant the ERP user its own two, if PUBLIC was the only grant it had
@@ -96,10 +96,10 @@ GRANT CONNECT ON DATABASE pact_broker TO pactbroker;
 The easiest way in:
 
 ```bash
-gcloud sql connect kuza-pg --user=postgres --project=pave-504011
+gcloud sql connect kuza --user=postgres --project=pave-504011
 ```
 
-Check it worked: connecting as `pactbroker` to `erp_db` must be refused.
+Check it worked: connecting as `pactbroker` to `kuza_erp` must be refused.
 
 ## Cost
 
@@ -173,13 +173,41 @@ curl -fsS -u "$PACT_BROKER_USERNAME:$PACT_BROKER_PASSWORD" \
 The second one must fail without the credentials. If it succeeds without them,
 public read is still on and anyone can read your contracts.
 
+## Never run the break-it-on-purpose test against this broker
+
+`platform-infra` proves the gate by renaming a field and checking that the
+verification fails. That job runs against a broker started inside the pipeline,
+and it must stay that way.
+
+Run it against the shared broker and two things happen:
+
+- the failed verification is published under a `<sha>-dirty` version, which
+  becomes the newest version on `main`, and every other service's gate then sees
+  a FAILED row and refuses to deploy
+- cleaning up means deleting a version from the broker by hand
+
+If you ever want to try it by hand against a real broker, stop the result being
+published:
+
+```bash
+PACT_SKIP_PUBLISH_VERIFICATION=true npm run pact:provider
+```
+
+## A dirty tree makes a version nobody published
+
+The version is the git commit, and an uncommitted change adds a `-dirty` suffix.
+That version has no contract in the broker, so the gate refuses it. This is
+correct: it is refusing to bless a build that does not match any commit.
+
+If `can-i-deploy` says NO and the reason is "unknown", check `git status` first.
+
 ## Backups and restore
 
 Cloud SQL takes a daily backup at 02:00. To list and restore:
 
 ```bash
-gcloud sql backups list --instance=kuza-pg
-gcloud sql backups restore <backup-id> --restore-instance=kuza-pg
+gcloud sql backups list --instance=kuza
+gcloud sql backups restore <backup-id> --restore-instance=kuza
 ```
 
 Restoring the shared instance restores the ERP databases too. Treat a broker
