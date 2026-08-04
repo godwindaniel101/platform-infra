@@ -9,11 +9,26 @@ const TIMEOUT_MS = Number(process.env.WAIT_TIMEOUT_MS ?? 120_000)
 const POLL_MS = 500
 
 async function httpUp(url) {
+  // A REF'D timer, not AbortSignal.timeout().
+  //
+  // AbortSignal.timeout() creates an UNREF'D timer on purpose, so it cannot
+  // hold a process open. While undici is still setting up its socket there is
+  // then a moment with no live handle at all, the event loop looks empty, and
+  // node kills a pending TOP-LEVEL await with exit code 13. It reads as an
+  // instant unexplained failure: the script prints two lines and vanishes in
+  // 50 ms.
+  //
+  // A ref'd timer keeps a handle alive for the whole request and still
+  // guarantees that the promise settles.
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 1_500)
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(1_500) })
+    const res = await fetch(url, { signal: controller.signal })
     return res.ok
   } catch {
     return false
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -31,7 +46,12 @@ const pending = new Map(CHECKS.map((c) => [c.name, c]))
 
 process.stdout.write('waiting for infrastructure')
 
-while (pending.size > 0) {
+// One live handle for the whole poll, so the event loop is never empty while
+// a check is in flight. See the note in httpUp.
+const keepAlive = setInterval(() => {}, 1_000)
+
+try {
+  while (pending.size > 0) {
   if (Date.now() - started > TIMEOUT_MS) {
     process.stdout.write('\n')
     console.error(`timeout. still down: ${[...pending.keys()].join(', ')}`)
@@ -50,6 +70,10 @@ while (pending.size > 0) {
     process.stdout.write('.')
     await sleep(POLL_MS)
   }
+}
+
+} finally {
+  clearInterval(keepAlive)
 }
 
 process.stdout.write(`\nall infrastructure is ready in ${Date.now() - started} ms\n`)
