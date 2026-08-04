@@ -240,11 +240,16 @@ jobs:
           PACT_DATABASE_URL: postgres://pact:pact@localhost:5434/switch_test_db
           PACT_REDIS_URL: redis://localhost:6380/1
         run: |
-          if npm run pact:provider 2>&1 | tee /tmp/verify.log; then
+          # Capture WITHOUT a pipeline. `cmd | tee` reports the exit status of
+          # tee, which always succeeds, so the failure this job exists to see
+          # would be read as a pass.
+          if npm run pact:provider > /tmp/verify.log 2>&1; then
+            cat /tmp/verify.log
             echo "::error::THE GATE IS BROKEN. The provider verification passed with a renamed field."
             echo "The contract testing is not protecting anything. Do not trust this pipeline."
             exit 1
           fi
+          cat /tmp/verify.log
 
           # It must fail for the RIGHT reason. A verification that fell over
           # because the provider would not start would also be non-zero, and
